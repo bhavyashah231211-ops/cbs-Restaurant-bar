@@ -1,10 +1,11 @@
-/* CBSystem Restaurant — cloud adapter.
-   Loaded AFTER the POS script. It replaces the old direct-Supabase sync with the secure
-   multi-tenant function (staff key per business). The POS code itself is not changed. */
+/* CBSystem Restaurant — cloud adapter + plan permissions.
+   Loaded AFTER the POS script (staff/index.html adds it). It replaces the old direct-Supabase sync with the
+   secure multi-tenant function (staff key per business) and applies the venue's plan: which screens are on,
+   table / staff / device limits. The POS code itself (pos.html) is not changed. */
 (function () {
   'use strict';
   const API = 'https://wpfqxxnqksbkyzmcipft.supabase.co/functions/v1/cbs-biz';
-  const KEYK = 'cbs_rest_key', BIZK = 'cbs_rest_biz';
+  const KEYK = 'cbs_rest_key', BIZK = 'cbs_rest_biz', DEVK = 'cbs_rest_dev', FEATK = 'cbs_rest_feat', PAIDK = 'cbs_rest_paid';
 
   const BIZ = (function () {
     let b = (new URLSearchParams(location.search).get('biz') || '').trim().toLowerCase();
@@ -25,13 +26,137 @@
   }
 
   const getKey = () => { try { return localStorage.getItem(KEYK) || ''; } catch (e) { return ''; } };
+  function deviceId() {
+    try {
+      let d = localStorage.getItem(DEVK);
+      if (!d) {
+        d = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (String(Date.now()) + Math.random().toString(36).slice(2));
+        localStorage.setItem(DEVK, d);
+      }
+      return d;
+    } catch (e) { return ''; }
+  }
 
-  let ts = 0, pollT = null, pushT = null, pushing = false, dirty = false, seq = 0, connected = false, gotFirst = false;
+  /* ---------- plan / permissions (sent by the server on every sync) ---------- */
+  const FEAT_ALL = { qr_order: true, takeaway: true, kitchen: true, bar: true, bookings: true, reports: 'full', sumup: true, owner_access: true, max_tables: null, max_staff: null, max_devices: null };
+  let FEAT = Object.assign({}, FEAT_ALL);
+  try { Object.assign(FEAT, JSON.parse(localStorage.getItem(FEATK + ':' + BIZ) || '{}')); } catch (e) {}
+
+  const st = document.createElement('style');
+  st.textContent = '.cbs-off{display:none!important}';
+  document.head.appendChild(st);
+
+  function setFeatures(f) {
+    if (!f || typeof f !== 'object') return;
+    FEAT = Object.assign({}, FEAT_ALL, f);
+    try { localStorage.setItem(FEATK + ':' + BIZ, JSON.stringify(FEAT)); } catch (e) {}
+    applyFeatures();
+  }
+  function setPaid(p) {
+    try { if (p) localStorage.setItem(PAIDK + ':' + BIZ, p); else localStorage.removeItem(PAIDK + ':' + BIZ); } catch (e) {}
+    applyFeatures();
+  }
+
+  function planNote() {
+    let n = document.getElementById('cbs-plan-note'), pu = '';
+    try { pu = localStorage.getItem(PAIDK + ':' + BIZ) || ''; } catch (e) {}
+    let msg = '';
+    if (pu) {
+      const days = Math.ceil((new Date(pu).getTime() - Date.now()) / 864e5);
+      if (days <= 7) msg = days >= 0
+        ? 'Subscription ends ' + new Date(pu).toLocaleDateString('en-GB') + ' (' + days + ' day' + (days === 1 ? '' : 's') + ' left)'
+        : 'Subscription overdue. Please renew to avoid interruption';
+    }
+    if (!msg) { if (n) n.remove(); return; }
+    if (!n) {
+      n = document.createElement('div'); n.id = 'cbs-plan-note';
+      n.style.cssText = 'position:fixed;left:10px;bottom:calc(8px + env(safe-area-inset-bottom,0px));z-index:9997;background:#2a1a10;border:1px solid #ff6b35;color:#ffb38f;border-radius:8px;padding:4px 10px;font-size:11px;font-family:system-ui,sans-serif';
+      document.body.appendChild(n);
+    }
+    if (n.textContent !== msg) n.textContent = msg;
+  }
+
+  function applyFeatures() {
+    if (!document.body) return;
+    const off = (sel, on) => document.querySelectorAll(sel).forEach(e => e.classList.toggle('cbs-off', !!on));
+    const noSelf = !FEAT.qr_order && !FEAT.takeaway;
+    off('.sc-kitchen', !FEAT.kitchen);
+    off('.sc-bar', !FEAT.bar);
+    off('.sc-self', noSelf);
+    document.querySelectorAll('#t-tabs .tab').forEach(b => {
+      const c = b.getAttribute('onclick') || '';
+      const hide = (!FEAT.kitchen && /'(k-view|ow-k)'/.test(c)) || (!FEAT.bar && /'(bar-view|ow-bar)'/.test(c)) || (!FEAT.bookings && c.indexOf("'ow-bk'") > -1);
+      b.classList.toggle('cbs-off', hide);
+    });
+    off('button[onclick="sendK()"],button[onclick="wSendKitchen()"]', !FEAT.kitchen);
+    off('button[onclick="sendBr()"],button[onclick="wSendBar()"]', !FEAT.bar);
+    off('#qr-toggle-btn', !FEAT.qr_order);
+    const qr = document.getElementById('qr-base-url');
+    if (qr) { const c = qr.closest('.set-card'); if (c) c.classList.toggle('cbs-off', noSelf); }
+    const tt = document.getElementById('t-type');
+    if (tt) { const sf = tt.closest('.sf'), col = sf && sf.parentElement; if (col) col.classList.toggle('cbs-off', !FEAT.sumup); }
+    if (!FEAT.sumup) {
+      const l = document.querySelector('#pm-card .pay-sb'); if (l && l.textContent !== 'Card machine') l.textContent = 'Card machine';
+      document.querySelectorAll('.sumup-logo').forEach(e => { if (e.textContent !== 'CARD') e.textContent = 'CARD'; });
+    }
+    const ti = document.getElementById('s-tc'); if (ti && FEAT.max_tables) ti.max = FEAT.max_tables;
+    planNote();
+  }
+
+  /* reports: "basic" plan keeps only the summary cards */
+  function trimReport(id) {
+    if (FEAT.reports !== 'basic') return;
+    const el = document.getElementById(id); if (!el) return;
+    const keep = el.querySelector('.dash-g'), title = el.firstElementChild;
+    Array.prototype.slice.call(el.children).forEach(c => { if (c !== keep && c !== title) c.remove(); });
+    if (!document.getElementById(id + '-up')) {
+      const n = document.createElement('div'); n.id = id + '-up';
+      n.style.cssText = 'margin-top:14px;padding:12px;border:1px dashed var(--border);border-radius:10px;color:var(--text2);font-size:0.8rem';
+      n.textContent = 'Detailed reports are not included in your plan. Contact support to upgrade.';
+      el.appendChild(n);
+    }
+  }
+  function wrap(name, fn) {
+    const o = window[name]; if (typeof o !== 'function') return;
+    window[name] = function () { return fn(o, this, arguments); };
+  }
+  wrap('renderRPT', function (o, t, a) { const r = o.apply(t, a); try { trimReport('rpt-view'); } catch (e) {} return r; });
+  wrap('renderORpt', function (o, t, a) { const r = o.apply(t, a); try { trimReport('ow-rpt'); } catch (e) {} return r; });
+
+  /* staff limit (the server also enforces it) */
+  const activeStaff = (skip) => DB.get('staff').filter((s, i) => s.active !== false && i !== skip).length;
+  wrap('addStaff', function (o, t, a) {
+    if (FEAT.max_staff && activeStaff(-1) >= FEAT.max_staff) { toast('Your plan allows ' + FEAT.max_staff + ' staff logins', '⚠️', 't-o'); return; }
+    return o.apply(t, a);
+  });
+  wrap('upS', function (o, t, a) {
+    if (a[1] === 'active' && a[2] && FEAT.max_staff && activeStaff(a[0]) >= FEAT.max_staff) {
+      toast('Your plan allows ' + FEAT.max_staff + ' staff logins', '⚠️', 't-o'); renderStaffMgr(); return;
+    }
+    return o.apply(t, a);
+  });
+  /* table limit (the server also enforces it) */
+  wrap('saveVenue', function (o, t, a) {
+    const i = document.getElementById('s-tc');
+    if (FEAT.max_tables && i && parseInt(i.value) > FEAT.max_tables) { i.value = FEAT.max_tables; toast('Your plan allows up to ' + FEAT.max_tables + ' tables', '⚠️', 't-o'); }
+    return o.apply(t, a);
+  });
+
+  try {
+    let raf = 0;
+    new MutationObserver(function () {
+      if (raf) return;
+      raf = requestAnimationFrame(function () { raf = 0; try { applyFeatures(); } catch (e) {} });
+    }).observe(document.body, { childList: true, subtree: true });
+  } catch (e) {}
+  window.addEventListener('load', function () { try { applyFeatures(); } catch (e) {} });
+
+  let ts = 0, pollT = null, pushT = null, pushing = false, dirty = false, seq = 0, connected = false, gotFirst = false, pullN = 0;
 
   async function call(action, extra) {
     const r = await fetch(API, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(Object.assign({ action: action, biz: BIZ, key: getKey() }, extra || {}))
+      body: JSON.stringify(Object.assign({ action: action, biz: BIZ, key: getKey(), device: deviceId() }, extra || {}))
     });
     return { s: r.status, j: await r.json().catch(() => ({})) };
   }
@@ -67,6 +192,12 @@
       const copy = JSON.parse(JSON.stringify(DB.d)); delete copy._biz;
       const r = await call('push', { data: copy });
       if (r.s === 200 && r.j.ok) { ts = r.j.ts; if (seq === mine) dirty = false; setSyncDot('ok'); }
+      else if (r.s === 403 && r.j && r.j.error === 'staff_limit') {
+        // refused: drop the local change and reload the saved data, so syncing never gets stuck
+        dirty = false; ts = 0; setSyncDot('ok');
+        toast(r.j.message || 'Staff limit reached for your plan', '⚠️', 't-o');
+        setTimeout(pull, 300);
+      }
       else if (r.s === 401 || r.s === 403) authFail(r.j);
       else { setSyncDot('off'); pushT = setTimeout(doPush, 5000); }
     } catch (e) { setSyncDot('off'); pushT = setTimeout(doPush, 5000); }
@@ -84,9 +215,12 @@
   async function pull() {
     if (!connected || pushing || dirty) return;
     try {
-      const r = await call('pull', { since: ts });
+      // the device id is sent on the first pull and about every 30 seconds after that
+      const r = await call('pull', { since: ts, device: (pullN++ % 20 === 0) ? deviceId() : undefined });
       if (r.s === 401 || r.s === 403) { authFail(r.j); return; }
       if (r.s !== 200) throw new Error('bad');
+      if (r.j.features) setFeatures(r.j.features);
+      if ('paid_until' in r.j) setPaid(r.j.paid_until);
       if (r.j.unchanged) { setSyncDot('ok'); first(); return; }
       if (!r.j.data) return;
       if (pushing || dirty) return;
@@ -122,8 +256,11 @@
 
   function authFail(j) {
     connected = false; clearInterval(pollT);
-    if (j && j.error === 'suspended') { showMsg('This account is suspended. Please contact support.'); return; }
-    try { localStorage.removeItem(KEYK); } catch (e) {}
+    const e = j && j.error;
+    if (e === 'suspended') { showMsg('This account is suspended. Please contact support.'); return; }
+    if (e === 'expired') { showMsg('Your subscription has expired. Please contact support to renew.'); return; }
+    if (e === 'device_limit') { showMsg((j.message || 'Device limit reached for your plan') + '. Ask your administrator to free a device.'); return; }
+    try { localStorage.removeItem(KEYK); } catch (x) {}
     showConnect('The staff key is no longer valid. Enter the new key.');
   }
 
@@ -167,7 +304,12 @@
       if (r.s === 200) {
         try { localStorage.setItem(BIZK, b); localStorage.setItem(KEYK, k); if (b !== BIZ) stash(); } catch (e) {}
         location.href = location.pathname + '?biz=' + encodeURIComponent(b);
-      } else if (r.s === 403) err.textContent = 'This account is suspended. Please contact support.';
+      } else if (r.s === 403) {
+        const e = r.j && r.j.error;
+        err.textContent = e === 'device_limit' ? (r.j.message || 'Device limit reached for your plan') + '. Ask your administrator.'
+          : e === 'expired' ? 'Your subscription has expired. Please contact support.'
+          : 'This account is suspended. Please contact support.';
+      }
       else err.textContent = 'Business id or staff key not recognised';
     } catch (e) { err.textContent = 'Cannot reach the server. Check the internet connection.'; }
   }
@@ -230,5 +372,5 @@
     document.querySelectorAll('#ow-set button[onclick="downloadSelfOrderFile()"]').forEach(b => { b.textContent = '📋 Copy order page link'; });
   }
   const origRenderSet = window.renderSet;
-  window.renderSet = function () { origRenderSet(); try { patchSettings(); } catch (e) {} };
+  window.renderSet = function () { origRenderSet(); try { patchSettings(); applyFeatures(); } catch (e) {} };
 })();
