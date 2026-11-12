@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CBSystem Groups and plans (admin)</title>
+<style>
+:root{--bg:#f3f5f7;--card:#fff;--ink:#17202b;--mute:#5d6b7a;--line:#d9e0e6;--acc:#0b6b5c;--acc-ink:#fff;--bad:#b3261e}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#12181e;--card:#1b242c;--ink:#e8edf1;--mute:#9aa8b5;--line:#2b3742;--acc:#35b9a3;--acc-ink:#07201b;--bad:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:1.4rem;margin:0 0 4px}h2{font-size:1.05rem;margin:0 0 12px}
+input,select,button{font:inherit;color:inherit}
+input,select{padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card);max-width:100%}
+button{padding:9px 14px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer}
+button.p{background:var(--acc);color:var(--acc-ink);border-color:var(--acc);font-weight:600}
+:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-top:16px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}.row b{flex:1 1 180px}
+.mute{color:var(--mute);font-size:.9rem}.err{color:var(--bad)}
+.key{margin-top:12px;padding:12px;border:2px dashed var(--acc);border-radius:8px;font:600 1.1rem ui-monospace,Consolas,monospace;word-break:break-all}
+</style>
+</head>
+<body>
+<main>
+<h1>Groups and plans</h1>
+<p class="mute">A group is one client who owns several venues. Create the group, link the venues, then give the client the owner key and the link to <code>/owner/</code>.</p>
+
+<div class="box">
+  <label for="ak" class="mute">Admin key</label><br>
+  <input id="ak" type="password" style="width:min(380px,100%)" autocomplete="off">
+  <button class="p" id="load">Load</button>
+  <div class="err" id="err" role="alert"></div>
+</div>
+
+<div class="box" id="newbox" hidden>
+  <h2>New group</h2>
+  <input id="gn" placeholder="Group name, e.g. Smith Group">
+  <input id="gi" placeholder="Group id, e.g. smith-group">
+  <button class="p" id="mk">Create group</button>
+  <div id="made"></div>
+</div>
+
+<div class="box" id="gbox" hidden><h2>Groups</h2><div id="groups"></div></div>
+<div class="box" id="bbox" hidden><h2>Venues</h2><div id="biz"></div></div>
+</main>
+
+<script>
+// Put your project URL here:
+const API = 'https://wpfqxxnqksbkyzmcipft.supabase.co/functions/v1/cbs-biz';
+
+const $ = (i) => document.getElementById(i);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let orgs = [];
+
+async function call(action, body) {
+  const r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-admin-key': $('ak').value.trim() }, body: JSON.stringify({ action, ...body }) });
+  const j = await r.json().catch(() => ({ error: 'Bad response from server' }));
+  if (!r.ok || j.error) throw new Error(j.error || 'Request failed');
+  return j;
+}
+const keyBox = (label, k) => `<div class="key">${esc(label)}: ${esc(k)}</div><p class="mute">Copy this now. It is not stored and cannot be shown again.</p>`;
+
+async function refresh() {
+  $('err').textContent = '';
+  try {
+    orgs = (await call('admin_listOrgs')).orgs;
+    const biz = (await call('admin_list')).businesses;
+    $('newbox').hidden = $('gbox').hidden = $('bbox').hidden = false;
+    $('groups').innerHTML = orgs.length ? orgs.map((o) => `
+      <div class="row"><b>${esc(o.name)} <span class="mute">${esc(o.id)}${o.active ? '' : ' · suspended'}</span></b>
+      <button data-reset="${esc(o.id)}">New owner key</button>
+      <button data-active="${esc(o.id)}" data-to="${o.active ? 0 : 1}">${o.active ? 'Suspend' : 'Reactivate'}</button></div>`).join('') : '<p class="mute">No groups yet.</p>';
+    const opts = (sel) => '<option value="">(no group)</option>' + orgs.map((o) => `<option value="${esc(o.id)}"${o.id === sel ? ' selected' : ''}>${esc(o.name)}</option>`).join('');
+    $('biz').innerHTML = biz.map((b) => { const f = b.features || {}; return `
+      <div class="row"><b>${esc(b.name)} <span class="mute">${esc(b.id)}</span></b>
+      <select data-sel="${esc(b.id)}" aria-label="Group for ${esc(b.name)}">${opts(b.org_id)}</select>
+      <button data-assign="${esc(b.id)}">Save group</button>
+      <div style="flex-basis:100%;display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <label>Plan <input data-plan value="${esc(b.plan || 'standard')}" style="width:110px"></label>
+        <label>Paid until <input type="date" data-paid value="${b.paid_until ? esc(String(b.paid_until).slice(0, 10)) : ''}"></label>
+        <label><input type="checkbox" data-so ${f.self_order === false ? '' : 'checked'}> Self-order</label>
+        <label><input type="checkbox" data-own ${f.owner_access === false ? '' : 'checked'}> Owner dashboard</label>
+        <label>Max tables <input type="number" min="1" data-mt value="${f.max_tables || ''}" style="width:80px"></label>
+        <button class="p" data-saveplan="${esc(b.id)}">Save plan</button>
+      </div></div>`; }).join('');
+  } catch (e) { $('err').textContent = e.message; }
+}
+
+$('load').onclick = refresh;
+$('mk').onclick = async () => {
+  $('made').innerHTML = '';
+  try {
+    const j = await call('admin_createOrg', { name: $('gn').value, id: $('gi').value });
+    $('made').innerHTML = keyBox('Owner key for ' + j.id, j.ownerKey); $('gn').value = $('gi').value = ''; refresh();
+  } catch (e) { $('made').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+};
+document.body.onclick = async (e) => {
+  const t = e.target.closest('button'); if (!t) return;
+  try {
+    if (t.dataset.reset) { if (!confirm('Replace the owner key for ' + t.dataset.reset + '? The old key stops working.')) return; const j = await call('admin_resetOrgKey', { org: t.dataset.reset }); $('made').innerHTML = keyBox('New owner key for ' + t.dataset.reset, j.ownerKey); window.scrollTo(0, $('newbox').offsetTop); }
+    else if (t.dataset.active) { await call('admin_setOrgActive', { org: t.dataset.active, active: t.dataset.to === '1' }); refresh(); }
+    else if (t.dataset.saveplan) { const r = t.closest('.row'); await call('admin_setPlan', { id: t.dataset.saveplan, plan: r.querySelector('[data-plan]').value, paid_until: r.querySelector('[data-paid]').value || null, features: { self_order: r.querySelector('[data-so]').checked, owner_access: r.querySelector('[data-own]').checked, max_tables: Number(r.querySelector('[data-mt]').value) || null } }); t.textContent = 'Saved'; setTimeout(() => (t.textContent = 'Save plan'), 1500); }
+    else if (t.dataset.assign) { const sel = document.querySelector('[data-sel="' + t.dataset.assign + '"]'); await call('admin_assignSite', { id: t.dataset.assign, org: sel.value }); t.textContent = 'Saved'; setTimeout(() => (t.textContent = 'Save'), 1500); }
+  } catch (er) { $('err').textContent = er.message; }
+};
+</script>
+</body>
+</html>
