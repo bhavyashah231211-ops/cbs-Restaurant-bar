@@ -54,6 +54,22 @@ const API = 'https://wpfqxxnqksbkyzmcipft.supabase.co/functions/v1/cbs-biz';
 const $ = (i) => document.getElementById(i);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 let orgs = [];
+const CHK = [['qr_order', 'QR ordering'], ['takeaway', 'Takeaway link'], ['kitchen', 'Kitchen screen'], ['bar', 'Bar screen'], ['bookings', 'Bookings'], ['sumup', 'SumUp cards'], ['owner_access', 'Owner dashboard']];
+const NUM = [['max_tables', 'Max tables'], ['max_staff', 'Max staff'], ['max_devices', 'Max devices']];
+const ON = { qr_order: true, takeaway: true, kitchen: true, bar: true, bookings: true, reports: 'full', sumup: true, owner_access: true, max_tables: null, max_staff: null, max_devices: null };
+const PRESETS = {
+  starter:  { ...ON, qr_order: false, takeaway: false, kitchen: false, bar: false, bookings: false, reports: 'basic', sumup: false, owner_access: false, max_tables: 15, max_staff: 5, max_devices: 1 },
+  standard: { ...ON, takeaway: false, bookings: false, max_tables: 40, max_staff: 15, max_devices: 3 },
+  pro:      { ...ON },
+};
+const feat = (f) => ({ ...ON, ...Object.fromEntries(Object.entries(f || {}).filter(([k]) => k in ON)),
+  qr_order: ((f || {}).qr_order ?? (f || {}).self_order) !== false, takeaway: ((f || {}).takeaway ?? (f || {}).self_order) !== false });
+const fill = (row, f) => {
+  for (const [k] of CHK) row.querySelector(`[data-k="${k}"]`).checked = !!f[k];
+  row.querySelector('[data-k="reports"]').value = f.reports;
+  for (const [k] of NUM) row.querySelector(`[data-k="${k}"]`).value = f[k] || '';
+};
+
 
 async function call(action, body) {
   const r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-admin-key': $('ak').value.trim() }, body: JSON.stringify({ action, ...body }) });
@@ -74,17 +90,18 @@ async function refresh() {
       <button data-reset="${esc(o.id)}">New owner key</button>
       <button data-active="${esc(o.id)}" data-to="${o.active ? 0 : 1}">${o.active ? 'Suspend' : 'Reactivate'}</button></div>`).join('') : '<p class="mute">No groups yet.</p>';
     const opts = (sel) => '<option value="">(no group)</option>' + orgs.map((o) => `<option value="${esc(o.id)}"${o.id === sel ? ' selected' : ''}>${esc(o.name)}</option>`).join('');
-    $('biz').innerHTML = biz.map((b) => { const f = b.features || {}; return `
+    $('biz').innerHTML = biz.map((b) => { const f = feat(b.features); const pl = PRESETS[b.plan] || b.plan === 'custom' ? b.plan : 'custom'; return `
       <div class="row"><b>${esc(b.name)} <span class="mute">${esc(b.id)}</span></b>
       <select data-sel="${esc(b.id)}" aria-label="Group for ${esc(b.name)}">${opts(b.org_id)}</select>
       <button data-assign="${esc(b.id)}">Save group</button>
       <div style="flex-basis:100%;display:flex;gap:12px;flex-wrap:wrap;align-items:center">
-        <label>Plan <input data-plan value="${esc(b.plan || 'standard')}" style="width:110px"></label>
-        <label>Paid until <input type="date" data-paid value="${b.paid_until ? esc(String(b.paid_until).slice(0, 10)) : ''}"></label>
-        <label><input type="checkbox" data-so ${f.self_order === false ? '' : 'checked'}> Self-order</label>
-        <label><input type="checkbox" data-own ${f.owner_access === false ? '' : 'checked'}> Owner dashboard</label>
-        <label>Max tables <input type="number" min="1" data-mt value="${f.max_tables || ''}" style="width:80px"></label>
+        <label>Plan <select data-k="plan">${['starter', 'standard', 'pro', 'custom'].map((x) => `<option value="${x}"${x === pl ? ' selected' : ''}>${x[0].toUpperCase() + x.slice(1)}</option>`).join('')}</select></label>
+        <label>Paid until <input type="date" data-k="paid" value="${b.paid_until ? esc(String(b.paid_until).slice(0, 10)) : ''}"></label>
+        ${CHK.map(([k, l]) => `<label><input type="checkbox" data-k="${k}" ${f[k] ? 'checked' : ''}> ${l}</label>`).join('')}
+        <label>Reports <select data-k="reports"><option value="basic"${f.reports === 'basic' ? ' selected' : ''}>Basic</option><option value="full"${f.reports === 'full' ? ' selected' : ''}>Full</option></select></label>
+        ${NUM.map(([k, l]) => `<label>${l} <input type="number" min="1" data-k="${k}" value="${f[k] || ''}" placeholder="no limit" style="width:90px"></label>`).join('')}
         <button class="p" data-saveplan="${esc(b.id)}">Save plan</button>
+        <button data-resetdev="${esc(b.id)}">Reset devices</button>
       </div></div>`; }).join('');
   } catch (e) { $('err').textContent = e.message; }
 }
@@ -102,9 +119,14 @@ document.body.onclick = async (e) => {
   try {
     if (t.dataset.reset) { if (!confirm('Replace the owner key for ' + t.dataset.reset + '? The old key stops working.')) return; const j = await call('admin_resetOrgKey', { org: t.dataset.reset }); $('made').innerHTML = keyBox('New owner key for ' + t.dataset.reset, j.ownerKey); window.scrollTo(0, $('newbox').offsetTop); }
     else if (t.dataset.active) { await call('admin_setOrgActive', { org: t.dataset.active, active: t.dataset.to === '1' }); refresh(); }
-    else if (t.dataset.saveplan) { const r = t.closest('.row'); await call('admin_setPlan', { id: t.dataset.saveplan, plan: r.querySelector('[data-plan]').value, paid_until: r.querySelector('[data-paid]').value || null, features: { self_order: r.querySelector('[data-so]').checked, owner_access: r.querySelector('[data-own]').checked, max_tables: Number(r.querySelector('[data-mt]').value) || null } }); t.textContent = 'Saved'; setTimeout(() => (t.textContent = 'Save plan'), 1500); }
+    else if (t.dataset.saveplan) { const r = t.closest('.row'); const q = (k) => r.querySelector(`[data-k="${k}"]`); const features = { reports: q('reports').value }; for (const [k] of CHK) features[k] = q(k).checked; for (const [k] of NUM) features[k] = Number(q(k).value) || null; await call('admin_setPlan', { id: t.dataset.saveplan, plan: q('plan').value, paid_until: q('paid').value || null, features }); t.textContent = 'Saved'; setTimeout(() => (t.textContent = 'Save plan'), 1500); }
+    else if (t.dataset.resetdev) { if (!confirm('Forget all registered devices for ' + t.dataset.resetdev + '? Their tills will register again on next sync.')) return; await call('admin_clearDevices', { id: t.dataset.resetdev }); t.textContent = 'Reset'; setTimeout(() => (t.textContent = 'Reset devices'), 1500); }
     else if (t.dataset.assign) { const sel = document.querySelector('[data-sel="' + t.dataset.assign + '"]'); await call('admin_assignSite', { id: t.dataset.assign, org: sel.value }); t.textContent = 'Saved'; setTimeout(() => (t.textContent = 'Save'), 1500); }
   } catch (er) { $('err').textContent = er.message; }
+};
+document.body.onchange = (e) => {
+  const t = e.target; if (t.dataset.k !== 'plan' || !PRESETS[t.value]) return;
+  fill(t.closest('.row'), PRESETS[t.value]);
 };
 </script>
 </body>
